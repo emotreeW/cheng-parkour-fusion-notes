@@ -1,0 +1,440 @@
+diff --git a/legged_gym/legged_gym/envs/base/legged_robot_config.py b/legged_gym/legged_gym/envs/base/legged_robot_config.py
+index 83eb6cc..5b09dd6 100644
+--- a/legged_gym/legged_gym/envs/base/legged_robot_config.py
++++ b/legged_gym/legged_gym/envs/base/legged_robot_config.py
+@@ -391,6 +391,8 @@ class LeggedRobotCfgPPO(BaseConfig):
+         hidden_dims = 512
+         learning_rate = 1.e-3
+         num_steps_per_env = LeggedRobotCfg.depth.update_interval * 24
++        fusion_mode = "concat"
++        student_visual = "depth"
+ 
+     class estimator:
+         train_with_estimated_states = True
+diff --git a/legged_gym/legged_gym/utils/helpers.py b/legged_gym/legged_gym/utils/helpers.py
+index 86754ca..0fe1dd1 100644
+--- a/legged_gym/legged_gym/utils/helpers.py
++++ b/legged_gym/legged_gym/utils/helpers.py
+@@ -111,9 +111,13 @@ def get_load_path(root, load_run=-1, checkpoint=-1, model_name_include="model"):
+                 if name[:6] == model_name_cand:
+                     root = os.path.join(model_parent, name)
+     if checkpoint==-1:
+-        models = [file for file in os.listdir(root) if model_name_include in file]
+-        models.sort(key=lambda m: '{0:0>15}'.format(m))
+-        model = models[-1]
++        last_pt = os.path.join(root, "model_last.pt")
++        if os.path.isfile(last_pt):
++            model = "model_last.pt"
++        else:
++            models = [file for file in os.listdir(root) if model_name_include in file]
++            models.sort(key=lambda m: '{0:0>15}'.format(m))
++            model = models[-1]
+     else:
+         model = "model_{}.pt".format(checkpoint) 
+ 
+@@ -163,6 +167,10 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
+         # alg runner parameters
+         if args.use_camera:
+             cfg_train.depth_encoder.if_depth = args.use_camera
++        if getattr(args, "fusion_mode", None):
++            cfg_train.depth_encoder.fusion_mode = args.fusion_mode
++        if getattr(args, "student_visual", None):
++            cfg_train.depth_encoder.student_visual = args.student_visual
+         if args.max_iterations is not None:
+             cfg_train.runner.max_iterations = args.max_iterations
+         if args.resume:
+@@ -206,6 +214,8 @@ def get_args():
+         {"name": "--resumeid", "type": str, "help": "exptid"},
+         {"name": "--daggerid", "type": str, "help": "name of dagger run"},
+         {"name": "--use_camera", "action": "store_true", "default": False, "help": "render camera for distillation"},
++        {"name": "--fusion_mode", "type": str, "default": "concat", "help": "How visual z enters the student actor: concat, film_prop, hyper_last, film_vis, film_cat"},
++        {"name": "--student_visual", "type": str, "default": "depth", "help": "Student actor visual: depth CNN z or teacher scandots latent"},
+ 
+         {"name": "--mask_obs", "action": "store_true", "default": False, "help": "Mask observation when playing"},
+         {"name": "--use_jit", "action": "store_true", "default": False, "help": "Load jit script when playing"},
+diff --git a/rsl_rl/rsl_rl/modules/actor_critic.py b/rsl_rl/rsl_rl/modules/actor_critic.py
+index da6dfcb..5111c8c 100644
+--- a/rsl_rl/rsl_rl/modules/actor_critic.py
++++ b/rsl_rl/rsl_rl/modules/actor_critic.py
+@@ -33,10 +33,13 @@ import numpy as np
+ import code
+ import torch
+ import torch.nn as nn
++import torch.nn.functional as F
+ from torch.distributions import Normal
+ from torch.nn.modules import rnn
+ from torch.nn.modules.activation import ReLU
+ 
++FUSION_MODES = ("concat", "film_prop", "hyper_last", "film_vis", "film_cat")
++
+ 
+ class StateHistoryEncoder(nn.Module):
+     def __init__(self, activation_fn, input_size, tsteps, output_size, tanh_encoder_output=False):
+@@ -95,17 +98,24 @@ class Actor(nn.Module):
+                  num_priv_latent, 
+                  num_priv_explicit, 
+                  num_hist, activation, 
+-                 tanh_encoder_output=False) -> None:
++                 tanh_encoder_output=False,
++                 fusion_mode="concat") -> None:
+         super().__init__()
+         # prop -> scan -> priv_explicit -> priv_latent -> hist
+         # actor input: prop -> scan -> priv_explicit -> latent
++        if fusion_mode not in FUSION_MODES:
++            raise ValueError("fusion_mode must be one of {}, got {}".format(FUSION_MODES, fusion_mode))
++        self.fusion_mode = fusion_mode
+         self.num_prop = num_prop
+         self.num_scan = num_scan
+         self.num_hist = num_hist
+         self.num_actions = num_actions
+         self.num_priv_latent = num_priv_latent
+         self.num_priv_explicit = num_priv_explicit
++        self.actor_hidden_dims = list(actor_hidden_dims)
+         self.if_scan_encode = scan_encoder_dims is not None and num_scan > 0
++        # film_prop / hyper_last: z modulates the MLP, not concatenated
++        self.concat_z = fusion_mode in ("concat", "film_vis", "film_cat")
+ 
+         if len(priv_encoder_dims) > 0:
+                     priv_encoder_layers = []
+@@ -119,6 +129,7 @@ class Actor(nn.Module):
+         else:
+             self.priv_encoder = nn.Identity()
+             priv_encoder_output_dim = num_priv_latent
++        self.priv_encoder_output_dim = priv_encoder_output_dim
+ 
+         self.history_encoder = StateHistoryEncoder(activation, num_prop, num_hist, priv_encoder_output_dim)
+ 
+@@ -138,17 +149,19 @@ class Actor(nn.Module):
+         else:
+             self.scan_encoder = nn.Identity()
+             self.scan_encoder_output_dim = num_scan
+-        
++
++        scan_in_dim = self.scan_encoder_output_dim if self.concat_z else 0
++        in_dim = num_prop + scan_in_dim + num_priv_explicit + priv_encoder_output_dim
++        hidden0 = actor_hidden_dims[0]
++        z_dim = self.scan_encoder_output_dim
++
+         actor_layers = []
+-        actor_layers.append(nn.Linear(num_prop+
+-                                      self.scan_encoder_output_dim+
+-                                      num_priv_explicit+
+-                                      priv_encoder_output_dim, 
+-                                      actor_hidden_dims[0]))
++        actor_layers.append(nn.Linear(in_dim, hidden0))
+         actor_layers.append(activation)
+         for l in range(len(actor_hidden_dims)):
+             if l == len(actor_hidden_dims) - 1:
+-                actor_layers.append(nn.Linear(actor_hidden_dims[l], num_actions))
++                if fusion_mode != "hyper_last":
++                    actor_layers.append(nn.Linear(actor_hidden_dims[l], num_actions))
+             else:
+                 actor_layers.append(nn.Linear(actor_hidden_dims[l], actor_hidden_dims[l + 1]))
+                 actor_layers.append(activation)
+@@ -156,43 +169,82 @@ class Actor(nn.Module):
+             actor_layers.append(nn.Tanh())
+         self.actor_backbone = nn.Sequential(*actor_layers)
+ 
++        if fusion_mode in ("film_prop", "film_cat"):
++            self.film_gen = nn.Sequential(
++                nn.Linear(z_dim, 256),
++                nn.ELU(),
++                nn.Linear(256, 2 * hidden0),
++            )
++            nn.init.zeros_(self.film_gen[-1].weight)
++            nn.init.zeros_(self.film_gen[-1].bias)
++            self.film_gen[-1].bias.data[:hidden0] = 1.0
++        else:
++            self.film_gen = None
++
++        if fusion_mode == "hyper_last":
++            last_h = actor_hidden_dims[-1]
++            self.hyper_W_base = nn.Parameter(torch.zeros(num_actions, last_h))
++            self.hyper_b_base = nn.Parameter(torch.zeros(num_actions))
++            self.hyper_gen = nn.Sequential(
++                nn.Linear(z_dim, 128),
++                nn.ELU(),
++                nn.Linear(128, num_actions * last_h + num_actions),
++            )
++            nn.init.zeros_(self.hyper_gen[-1].weight)
++            nn.init.zeros_(self.hyper_gen[-1].bias)
++        else:
++            self.hyper_W_base = None
++            self.hyper_b_base = None
++            self.hyper_gen = None
++
++    def _scan_latent(self, obs, scandots_latent):
++        if not self.if_scan_encode:
++            return None
++        if scandots_latent is not None:
++            return scandots_latent
++        obs_scan = obs[:, self.num_prop:self.num_prop + self.num_scan]
++        return self.scan_encoder(obs_scan)
++
++    def _priv_and_hist(self, obs, hist_encoding):
++        obs_priv_explicit = obs[:, self.num_prop + self.num_scan:self.num_prop + self.num_scan + self.num_priv_explicit]
++        if hist_encoding:
++            latent = self.infer_hist_latent(obs)
++        else:
++            latent = self.infer_priv_latent(obs)
++        return obs_priv_explicit, latent
++
+     def forward(self, obs, hist_encoding: bool, eval=False, scandots_latent=None):
+-        if not eval:
+-            if self.if_scan_encode:
+-                obs_scan = obs[:, self.num_prop:self.num_prop + self.num_scan]
+-                if scandots_latent is None:
+-                    scan_latent = self.scan_encoder(obs_scan)   
+-                else:
+-                    scan_latent = scandots_latent
+-                obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent], dim=1)
+-            else:
++        scan_latent = self._scan_latent(obs, scandots_latent)
++        obs_priv_explicit, latent = self._priv_and_hist(obs, hist_encoding)
++        if self.concat_z:
++            if scan_latent is None:
+                 obs_prop_scan = obs[:, :self.num_prop + self.num_scan]
+-            obs_priv_explicit = obs[:, self.num_prop + self.num_scan:self.num_prop + self.num_scan + self.num_priv_explicit]
+-            if hist_encoding:
+-                latent = self.infer_hist_latent(obs)
+             else:
+-                latent = self.infer_priv_latent(obs)
+-            backbone_input = torch.cat([obs_prop_scan, obs_priv_explicit, latent], dim=1)
+-            backbone_output = self.actor_backbone(backbone_input)
+-            return backbone_output
+-        else:
+-            if self.if_scan_encode:
+-                obs_scan = obs[:, self.num_prop:self.num_prop + self.num_scan]
+-                if scandots_latent is None:
+-                    scan_latent = self.scan_encoder(obs_scan)   
+-                else:
+-                    scan_latent = scandots_latent
+                 obs_prop_scan = torch.cat([obs[:, :self.num_prop], scan_latent], dim=1)
+-            else:
+-                obs_prop_scan = obs[:, :self.num_prop + self.num_scan]
+-            obs_priv_explicit = obs[:, self.num_prop + self.num_scan:self.num_prop + self.num_scan + self.num_priv_explicit]
+-            if hist_encoding:
+-                latent = self.infer_hist_latent(obs)
+-            else:
+-                latent = self.infer_priv_latent(obs)
+             backbone_input = torch.cat([obs_prop_scan, obs_priv_explicit, latent], dim=1)
+-            backbone_output = self.actor_backbone(backbone_input)
+-            return backbone_output
++        else:
++            backbone_input = torch.cat([obs[:, :self.num_prop], obs_priv_explicit, latent], dim=1)
++
++        if self.fusion_mode in ("film_prop", "film_cat"):
++            h = self.actor_backbone[0](backbone_input)
++            h = self.actor_backbone[1](h)
++            gb = self.film_gen(scan_latent)
++            gamma, beta = gb.chunk(2, dim=-1)
++            h = gamma * h + beta
++            return self.actor_backbone[2:](h)
++
++        if self.fusion_mode == "hyper_last":
++            h = self.actor_backbone(backbone_input)
++            delta = self.hyper_gen(scan_latent)
++            n_act = self.num_actions
++            last_h = self.actor_hidden_dims[-1]
++            dW = delta[:, :n_act * last_h].view(-1, n_act, last_h)
++            db = delta[:, n_act * last_h:]
++            W = self.hyper_W_base.unsqueeze(0) + dW
++            b = self.hyper_b_base.unsqueeze(0) + db
++            return torch.bmm(W, h.unsqueeze(-1)).squeeze(-1) + b
++
++        return self.actor_backbone(backbone_input)
+     
+     def infer_priv_latent(self, obs):
+         priv = obs[:, self.num_prop + self.num_scan + self.num_priv_explicit: self.num_prop + self.num_scan + self.num_priv_explicit + self.num_priv_latent]
+@@ -206,6 +258,50 @@ class Actor(nn.Module):
+         scan = obs[:, self.num_prop:self.num_prop + self.num_scan]
+         return self.scan_encoder(scan)
+ 
++
++def _copy_linear(src, dst):
++    dst.weight.data.copy_(src.weight.data)
++    if src.bias is not None and dst.bias is not None:
++        dst.bias.data.copy_(src.bias.data)
++
++
++def copy_compatible_actor(src, dst):
++    """Copy history/priv/scan encoders and matching MLP slices from teacher concat actor."""
++    dst.priv_encoder.load_state_dict(src.priv_encoder.state_dict())
++    dst.history_encoder.load_state_dict(src.history_encoder.state_dict())
++    dst.scan_encoder.load_state_dict(src.scan_encoder.state_dict())
++    src_in = src.actor_backbone[0]
++    dst_in = dst.actor_backbone[0]
++    if src_in.weight.shape == dst_in.weight.shape:
++        _copy_linear(src_in, dst_in)
++    elif dst.fusion_mode in ("film_prop", "hyper_last"):
++        # teacher first layer is [prop | scan_z | priv_explicit | hist]
++        n_prop = dst.num_prop
++        n_z = src.scan_encoder_output_dim
++        n_priv = dst.num_priv_explicit
++        w = src_in.weight.data
++        dst_in.weight.data.copy_(torch.cat([w[:, :n_prop], w[:, n_prop + n_z:n_prop + n_z + n_priv + dst.priv_encoder_output_dim]], dim=1))
++        if src_in.bias is not None and dst_in.bias is not None:
++            dst_in.bias.data.copy_(src_in.bias.data)
++    src_lin = [m for m in src.actor_backbone.modules() if isinstance(m, nn.Linear)]
++    dst_lin = [m for m in dst.actor_backbone.modules() if isinstance(m, nn.Linear)]
++    used = {0}
++    for d in dst_lin[1:]:
++        for i, s in enumerate(src_lin):
++            if i in used:
++                continue
++            if s.weight.shape == d.weight.shape:
++                _copy_linear(s, d)
++                used.add(i)
++                break
++    if dst.fusion_mode == "hyper_last" and src_lin:
++        last = src_lin[-1]
++        if last.weight.shape == dst.hyper_W_base.shape:
++            dst.hyper_W_base.data.copy_(last.weight.data)
++            if last.bias is not None:
++                dst.hyper_b_base.data.copy_(last.bias.data)
++
++
+ class ActorCriticRMA(nn.Module):
+     is_recurrent = False
+     def __init__(self,  num_prop,
+diff --git a/rsl_rl/rsl_rl/modules/depth_backbone.py b/rsl_rl/rsl_rl/modules/depth_backbone.py
+index a22ccb3..932f72a 100644
+--- a/rsl_rl/rsl_rl/modules/depth_backbone.py
++++ b/rsl_rl/rsl_rl/modules/depth_backbone.py
+@@ -4,11 +4,14 @@ import sys
+ import torchvision
+ 
+ class RecurrentDepthBackbone(nn.Module):
+-    def __init__(self, base_backbone, env_cfg) -> None:
++    def __init__(self, base_backbone, env_cfg, fusion_mode="concat") -> None:
+         super().__init__()
+         activation = nn.ELU()
+         last_activation = nn.Tanh()
+         self.base_backbone = base_backbone
++        self.fusion_mode = fusion_mode
++        n_prop = 53 if env_cfg is None else env_cfg.env.n_proprio
++        cnn_dim = 32
+         if env_cfg == None:
+             self.combination_mlp = nn.Sequential(
+                                     nn.Linear(32 + 53, 128),
+@@ -27,9 +30,24 @@ class RecurrentDepthBackbone(nn.Module):
+                                 last_activation
+                             )
+         self.hidden_states = None
++        if fusion_mode == "film_vis":
++            self.vis_film = nn.Sequential(
++                nn.Linear(n_prop, 64),
++                nn.ELU(),
++                nn.Linear(64, 2 * cnn_dim),
++            )
++            nn.init.zeros_(self.vis_film[-1].weight)
++            nn.init.zeros_(self.vis_film[-1].bias)
++            self.vis_film[-1].bias.data[:cnn_dim] = 1.0
++        else:
++            self.vis_film = None
+ 
+     def forward(self, depth_image, proprioception):
+         depth_image = self.base_backbone(depth_image)
++        if self.fusion_mode == "film_vis":
++            gb = self.vis_film(proprioception)
++            gamma, beta = gb.chunk(2, dim=-1)
++            depth_image = gamma * depth_image + beta
+         depth_latent = self.combination_mlp(torch.cat((depth_image, proprioception), dim=-1))
+         # depth_latent = self.base_backbone(depth_image)
+         depth_latent, self.hidden_states = self.rnn(depth_latent[:, None, :], self.hidden_states)
+diff --git a/rsl_rl/rsl_rl/runners/on_policy_runner.py b/rsl_rl/rsl_rl/runners/on_policy_runner.py
+index d751175..78aadb5 100644
+--- a/rsl_rl/rsl_rl/runners/on_policy_runner.py
++++ b/rsl_rl/rsl_rl/runners/on_policy_runner.py
+@@ -42,6 +42,7 @@ import datetime
+ 
+ from rsl_rl.algorithms import PPO
+ from rsl_rl.modules import *
++from rsl_rl.modules.actor_critic import Actor, copy_compatible_actor, get_activation
+ from rsl_rl.env import VecEnv
+ import sys
+ from copy import copy, deepcopy
+@@ -76,13 +77,37 @@ class OnPolicyRunner:
+         estimator = Estimator(input_dim=env.cfg.env.n_proprio, output_dim=env.cfg.env.n_priv, hidden_dims=self.estimator_cfg["hidden_dims"]).to(self.device)
+         # Depth encoder
+         self.if_depth = self.depth_encoder_cfg["if_depth"]
++        self.fusion_mode = self.depth_encoder_cfg.get("fusion_mode", "concat")
++        self.student_visual = self.depth_encoder_cfg.get("student_visual", "depth")
++        if self.student_visual not in ("depth", "scandots"):
++            raise ValueError("student_visual must be depth or scandots, got {}".format(self.student_visual))
++        print("fusion_mode={}".format(self.fusion_mode))
++        print("student_visual={}".format(self.student_visual))
+         if self.if_depth:
+             depth_backbone = DepthOnlyFCBackbone58x87(env.cfg.env.n_proprio, 
+                                                     self.policy_cfg["scan_encoder_dims"][-1], 
+                                                     self.depth_encoder_cfg["hidden_dims"],
+                                                     )
+-            depth_encoder = RecurrentDepthBackbone(depth_backbone, env.cfg).to(self.device)
+-            depth_actor = deepcopy(actor_critic.actor)
++            depth_encoder = RecurrentDepthBackbone(depth_backbone, env.cfg, fusion_mode=self.fusion_mode).to(self.device)
++            if self.fusion_mode in ("film_prop", "hyper_last", "film_cat"):
++                activation = get_activation(self.policy_cfg["activation"])
++                depth_actor = Actor(
++                    self.env.cfg.env.n_proprio,
++                    self.env.cfg.env.n_scan,
++                    self.env.num_actions,
++                    self.policy_cfg["scan_encoder_dims"],
++                    self.policy_cfg["actor_hidden_dims"],
++                    self.policy_cfg["priv_encoder_dims"],
++                    self.env.cfg.env.n_priv_latent,
++                    self.env.cfg.env.n_priv,
++                    self.env.cfg.env.history_len,
++                    activation,
++                    tanh_encoder_output=self.policy_cfg.get("tanh_encoder_output", False),
++                    fusion_mode=self.fusion_mode,
++                ).to(self.device)
++                copy_compatible_actor(actor_critic.actor, depth_actor)
++            else:
++                depth_actor = deepcopy(actor_critic.actor)
+         else:
+             depth_encoder = None
+             depth_actor = None
+@@ -269,7 +294,11 @@ class OnPolicyRunner:
+                 # obs_student[:, 6:8] = yaw.detach()
+                 obs_student[infos["delta_yaw_ok"], 6:8] = yaw.detach()[infos["delta_yaw_ok"]]
+                 delta_yaw_ok_buffer.append(torch.nonzero(infos["delta_yaw_ok"]).size(0) / infos["delta_yaw_ok"].numel())
+-                actions_student = self.alg.depth_actor(obs_student, hist_encoding=True, scandots_latent=depth_latent)
++                if self.student_visual == "scandots":
++                    actor_z = scandots_latent
++                else:
++                    actor_z = depth_latent
++                actions_student = self.alg.depth_actor(obs_student, hist_encoding=True, scandots_latent=actor_z)
+                 actions_student_buffer.append(actions_student)
+ 
+                 # detach actions before feeding the env
+@@ -321,6 +350,11 @@ class OnPolicyRunner:
+                (it-self.start_learning_iteration >= 5000 and it % (5*self.save_interval) == 0):
+                     self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+             ep_infos.clear()
++        if self.log_dir is not None:
++            last_it = tot_iter - 1
++            self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(last_it)))
++            self.save(os.path.join(self.log_dir, 'model_last.pt'))
++            print("saved model_{}.pt and model_last.pt (fusion_mode={}, student_visual={})".format(last_it, self.fusion_mode, self.student_visual))
+     
+     def log_vision(self, locs, width=80, pad=35):
+         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
+@@ -493,6 +527,8 @@ class OnPolicyRunner:
+         if self.if_depth:
+             state_dict['depth_encoder_state_dict'] = self.alg.depth_encoder.state_dict()
+             state_dict['depth_actor_state_dict'] = self.alg.depth_actor.state_dict()
++            state_dict['fusion_mode'] = self.fusion_mode
++            state_dict['student_visual'] = self.student_visual
+         torch.save(state_dict, path)
+ 
+     def load(self, path, load_optimizer=True):
+@@ -510,6 +546,9 @@ class OnPolicyRunner:
+             if 'depth_actor_state_dict' in loaded_dict:
+                 print("Saved depth actor detected, loading...")
+                 self.alg.depth_actor.load_state_dict(loaded_dict['depth_actor_state_dict'])
++            elif self.fusion_mode in ("film_prop", "hyper_last", "film_cat"):
++                print("No saved depth actor; copying compatible layers from loaded teacher into {} actor.".format(self.fusion_mode))
++                copy_compatible_actor(self.alg.actor_critic.actor, self.alg.depth_actor)
+             else:
+                 print("No saved depth actor, Copying actor critic actor to depth actor...")
+                 self.alg.depth_actor.load_state_dict(self.alg.actor_critic.actor.state_dict())

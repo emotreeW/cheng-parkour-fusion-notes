@@ -1,8 +1,92 @@
 # Cheng parkour notes: how $z$ enters the actor
 
-Setup: Isaac Gym, Unitree A1, Cheng extreme-parkour. Eval uses 256 environments. The metric is `mxd_mean` (waypoints / 7). Raw rows are in [`results/cheng_eval.jsonl`](results/cheng_eval.jsonl).
+Setup: Isaac Gym, Unitree A1, Cheng extreme-parkour. Eval uses 256 environments. The metric is `mxd_mean` (waypoints / 7). Raw rows are in [`results/cheng_eval.jsonl`](results/cheng_eval.jsonl). Commands are in [`configs/runs.md`](configs/runs.md).
 
 We froze the scandots teacher at `000-00` `model_0.pt` and distilled a forward-depth student. The student–teacher mixed gap is about 0.18. Changing how the 32-d visual latent $z$ enters the actor did not close that gap. Later experiments left this stack.
+
+## Code
+
+This tree is a modified copy of [chengxuxin/extreme-parkour](https://github.com/chengxuxin/extreme-parkour) at `d2ffe27`. Paper: [arXiv:2309.14341](https://arxiv.org/abs/2309.14341). License: CC BY-NC 4.0 (`LICENSE`, `NOTICE`).
+
+Isaac Gym is not included. Checkpoints are not included. The five files that differ from `d2ffe27` are listed in `NOTICE`. The full diff is [`patches/extreme-parkour-d2ffe27.diff`](patches/extreme-parkour-d2ffe27.diff).
+
+```
+rsl_rl/                 PPO, actor, depth backbone, DAgger runner
+legged_gym/             A1 parkour env, train/play/evaluate
+scripts/train_fusion.sh distill with --fusion_mode
+scripts/eval_one.py     256-env eval, writes jsonl
+scripts/check_fusion_dims.py  forward-shape check, no Gym
+configs/runs.md         exact commands for each row
+results/cheng_eval.jsonl
+```
+
+New flags:
+
+- `--fusion_mode {concat,film_prop,hyper_last,film_vis,film_cat}`
+- `--student_visual {depth,scandots}`
+- Distill writes `model_last.pt`. `--checkpoint -1` loads that file if present.
+
+## Install
+
+Python 3.8, PyTorch 1.10+cu113, Isaac Gym Preview 4 (Ada 4090 works; Blackwell SM_120 does not). Then:
+
+```bash
+# download Isaac Gym from NVIDIA; default path $HOME/isaacgym/python
+export ISAACGYM_PYTHON=$HOME/isaacgym/python
+conda create -n parkour python=3.8
+conda activate parkour
+bash install.sh
+```
+
+`install.sh` pip-installs `isaacgym`, `rsl_rl`, and `legged_gym` editable. Optional: copy `scripts/env.example.sh` to `scripts/env.sh`.
+
+Shape check without Gym:
+
+```bash
+python scripts/check_fusion_dims.py
+```
+
+## Train
+
+Teacher (Cheng base policy, no camera). We used an existing `000-00` `model_0.pt` and did not retrain it.
+
+```bash
+cd legged_gym
+python -u legged_gym/scripts/train.py --exptid 000-00-teacher --device cuda:0 --no_wandb --headless
+```
+
+Student distill, 5000 iterations, camera on, 192 environments by default:
+
+```bash
+bash scripts/train_fusion.sh concat 001-00-distill 5000
+bash scripts/train_fusion.sh film_prop 002-00-film_prop 5000
+bash scripts/train_fusion.sh hyper_last 003-00-hyper_last 5000
+bash scripts/train_fusion.sh film_vis 004-00-film_vis 5000
+bash scripts/train_fusion.sh film_cat 005-00-film_cat 5000
+```
+
+Smoke: `bash scripts/train_fusion.sh film_prop 002-smoke-film_prop 2 64`.
+
+Privileged scandots student:
+
+```bash
+bash scripts/train_scandots_stu.sh 006-00-scandots_stu 5000
+```
+
+One Gym process per machine. Weights land in `legged_gym/logs/parkour_new/<exptid>/`.
+
+## Eval
+
+256 environments, 1500 steps, terrains mixed / hurdle / step / gap / ramps.
+
+```bash
+python scripts/eval_one.py \
+  --eval_tag concat --eval_exptid 001-00 --eval_checkpoint 4800 \
+  --eval_terrain mixed --eval_num_envs 256 --eval_camera \
+  --eval_fusion_mode concat
+```
+
+`--eval_checkpoint -1` loads `model_last.pt`. Batch: `bash scripts/eval_fusion.sh`. Replicates on gap and ramps: `bash scripts/eval_rep.sh`. Print a table: `python scripts/print_table.py results/cheng_eval.jsonl`.
 
 ## 1. Stack
 

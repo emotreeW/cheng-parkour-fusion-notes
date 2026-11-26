@@ -1,0 +1,14 @@
+This repository is a modified copy of Extreme Parkour with Legged Robots
+(https://github.com/chengxuxin/extreme-parkour), commit d2ffe27.
+
+Upstream authors: Xuxin Cheng, Kexin Shi, Ananye Agarwal, Deepak Pathak.
+License: CC BY-NC 4.0 (see LICENSE). The rsl_rl and legged_gym packages also
+carry BSD-3-Clause files from ETH Zurich / NVIDIA.
+
+Changes relative to d2ffe27 are in patches/extreme-parkour-d2ffe27.diff:
+
+- fusion_mode for how visual z enters the student actor
+  (concat, film_prop, hyper_last, film_vis, film_cat)
+- student_visual=scandots, which feeds the teacher scandots latent into the
+  student actor while the yaw head still reads depth
+- save and load model_last.pt at the end of distillation
